@@ -116,7 +116,7 @@ class DynamicDataset:
     zfar = 1000
     
     def __init__(self, phase, scene_data, input_format, image_size,
-                 view_list, target_list, mask_list, label_list,
+                 view_list, target_list, mask_list, label_list, sensor_ids,
                  keep_fov=False, gl_frame=False,
                  input_transform=None, target_transform=None,
                  num_samples=None,
@@ -136,14 +136,20 @@ class DynamicDataset:
         # if render image size is different from camera image size, then shift principal point
         K_src = scene_data['intrinsic_matrix']
         old_size = scene_data['config']['viewport_size']
+        if sensor_ids[0] is not None and isinstance(K_src, dict):
+            # different image size for different cameras is not supported yet
+            # we can always rescale the image while preprocessing.
+            for K, old_size_from_sensor in K_src.values():
+                assert old_size_from_sensor == old_size
+
         self.src_sh = np.array(old_size)
         self.tgt_sh = np.array(list(map(lambda x:x//2**4 * 2**4, self.src_sh)))
         # self.tgt_sh = np.array([512,512])
         if phase=='train':
             self.tgt_sh = np.array(image_size)
-        assert len(view_list) == len(target_list)
-        
         print(f'{phase}_tgt_size', self.tgt_sh)
+        assert len(view_list) == len(target_list)
+        self.image_size = image_size
         self.view_list = view_list
         self.target_list = target_list
         self.mask_list = mask_list
@@ -151,6 +157,7 @@ class DynamicDataset:
         self.scene_data = scene_data
         self.input_format = input_format
         self.headless = headless
+        self.sensor_ids = scene_data['sensor_ids']
         # True
         self.renderer = None
         self.scene = None
@@ -221,35 +228,41 @@ class DynamicDataset:
         view_matrix = self.view_list[idx].astype(np.float32)
         target = load_image(self.target_list[idx])
 
-        
+        if self.sensor_ids[idx] is not None and isinstance(self.K_src, dict):
+            K_src, old_size = self.K_src[self.sensor_ids[idx]]
+        else:
+            K_src = self.K_src
+        src_sh = self.src_sh
+        tgt_sh = self.tgt_sh
+
         if self.phase=='train':
             # innner_batch 
-            Hs = self.get_transform_crop(self.inner_batch,8)
-            Ks = [H @self.K_src for H in Hs]
+            Hs = self.get_transform_crop(self.inner_batch, 8)
+            Ks = [H @K_src for H in Hs]
             targets = [self._warp(target, H) for H in Hs]
             if mask is None:
-                masks = [np.ones((self.tgt_sh[1], self.tgt_sh[0]), dtype=np.float32)]*len(Hs)
+                masks = [np.ones((tgt_sh[1], tgt_sh[0]), dtype=np.float32)]*len(Hs)
             else:
                 masks = [self._warp(mask, H) for H in Hs]
             if label is None:
                 labels = [np.zeros((target.shape[0], target.shape[1], 1), dtype=np.uint8)]*len(Hs)
             else:
                 labels = [self._warp(label, H) for H in Hs]
-            proj_matrixs = [get_proj_matrix(K, self.tgt_sh, self.znear, self.zfar).astype(np.float32) for K in Ks]
+            proj_matrix = [get_proj_matrix(K, tgt_sh, self.znear, self.zfar).astype(np.float32) for K in Ks]
             
         else:
-            K = rescale_K(self.K_src, self.tgt_sh/self.src_sh, False)
-            H = K @ np.linalg.inv(self.K_src)
+            K = rescale_K(K_src, tgt_sh/src_sh, False)
+            H = K @ np.linalg.inv(K_src)
             target = self._warp(target, H)
             if mask is None:
-                mask = np.ones((self.tgt_sh[1], self.tgt_sh[0]), dtype=np.float32)
+                mask = np.ones((tgt_sh[1], tgt_sh[0]), dtype=np.float32)
             else:
                 mask = self._warp(mask, H)
             if label is None:
                 label = np.zeros((target.shape[0], target.shape[1], 1), dtype=np.uint8)
             else:
                 label = self._warp(label, H) 
-            proj_matrix = get_proj_matrix(K, self.tgt_sh, self.znear, self.zfar).astype(np.float32)
+            proj_matrix = get_proj_matrix(K, tgt_sh, self.znear, self.zfar).astype(np.float32)
             # H = self.randomImageCrop()
             # K = H @self.K_src
             # target = self._warp(target, H)
@@ -271,7 +284,7 @@ class DynamicDataset:
             # headless
                 assert self.scene is not None, 'call load()'
                 app.Window(visible=False) # creates GL context
-                self.renderer = MultiscaleRender(self.scene, self.input_format, self.tgt_sh, supersampling=self.ss)
+                self.renderer = MultiscaleRender(self.scene, self.input_format, tgt_sh, supersampling=self.ss)
                 
             if self.drop_points:
                 self.scene.set_point_discard(np.random.rand(self.scene_data['pointcloud']['xyz'].shape[0]) < self.drop_points)
@@ -298,7 +311,7 @@ class DynamicDataset:
             return {'input': input_,
                     'view_matrix': np.array([view_matrix]*len(Hs)),
                     'intrinsic_matrix': np.array(Ks),
-                    'proj_matrix': np.array(proj_matrixs),
+                    'proj_matrix': np.array(proj_matrix),
                     'target': targets,
                     'target_filename':[self.target_list[idx]]*len(Hs),
                     'mask': torch.stack([torch.from_numpy(t) for t in masks],0),
@@ -434,6 +447,9 @@ def _get_splits(paths_file, ds_name, args):
 
     view_list = scene_data['view_matrix']
     camera_labels = scene_data['camera_labels']
+    sensor_ids = scene_data['sensor_ids']
+    if 'sensor_ids' is None:
+        sensor_ids = [None] * len(camera_labels)
 
     if 'target_name_func' in config:
         target_name_func = eval(config['target_name_func'])
@@ -459,23 +475,24 @@ def _get_splits(paths_file, ds_name, args):
 
     assert hasattr(args, 'splitter_module') and hasattr(args, 'splitter_args')
 
-    splits = args.splitter_module([view_list, target_list, mask_list, label_list], **args.splitter_args)
+    splits = args.splitter_module([view_list, target_list, mask_list, label_list, sensor_ids], **args.splitter_args)
     if args.eval_all:
         from READ.datasets.splitter import eval_all
-        splits = eval_all([view_list, target_list, mask_list, label_list], **args.splitter_args)
+        splits = eval_all([view_list, target_list, mask_list, label_list, sensor_ids], **args.splitter_args)
         
     view_list_train, view_list_val = splits[0]
     target_list_train, target_list_val = splits[1]
     mask_list_train, mask_list_val = splits[2]
     label_list_train, label_list_val = splits[3]
+    sensor_ids_train, sensor_ids_val = splits[4]
 
     # num_samples_train = int(config['num_samples_train']) if 'num_samples_train' in config else None
 
     ds_train = DynamicDataset('train', scene_data, input_format, args.crop_size, view_list_train, target_list_train, mask_list_train, label_list_train,
-        use_mesh=args.use_mesh, supersampling=args.supersampling, headless=args.headless, **args.train_dataset_args)
+        sensor_ids=sensor_ids_train, use_mesh=args.use_mesh, supersampling=args.supersampling, headless=args.headless, **args.train_dataset_args)
 
     ds_val = DynamicDataset('val', scene_data, input_format, args.crop_size, view_list_val, target_list_val, mask_list_val, label_list_val,
-        use_mesh=args.use_mesh, supersampling=args.supersampling, headless=args.headless, **args.val_dataset_args)
+        sensor_ids=sensor_ids_val, use_mesh=args.use_mesh, supersampling=args.supersampling, headless=args.headless, **args.val_dataset_args)
 
     return ds_train, ds_val
 

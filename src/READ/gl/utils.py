@@ -172,22 +172,24 @@ def crop_intrinsic_matrix(K, old_size, new_size):
 
 def intrinsics_from_xml(xml_file):
     root = ET.parse(xml_file).getroot()
-    calibration = root.find('chunk/sensors/sensor/calibration')
-    resolution = calibration.find('resolution')
-    width = float(resolution.get('width'))
-    height = float(resolution.get('height'))
-    f = float(calibration.find('f').text)
-    cx = width/2
-    cy = height/2
-
-    K = np.array([
-        [f, 0, cx],
-        [0, f, cy],
-        [0, 0,  1]
-        ], dtype=np.float32)
-
-    return K, (width, height)
-
+    sensors = root.findall('chunk/sensors/sensor')
+    intrinsics_dict = {}
+    for sensor in sensors:
+        sensor_id = sensor.get('id')
+        calibration = sensor.find('calibration')
+        resolution = calibration.find('resolution')
+        width = float(resolution.get('width'))
+        height = float(resolution.get('height'))
+        f = float(calibration.find('f').text)
+        cx = width/2
+        cy = height/2
+        K = np.array([
+            [f, 0, cx],
+            [0, f, cy],
+            [0, 0,  1]
+            ], dtype=np.float32)
+        intrinsics_dict[sensor_id] = K, (width, height)
+    return intrinsics_dict
 def intrinsics_from_ini(ini_path):
     conf = configparser.ConfigParser()
     conf.read(ini_path)
@@ -211,23 +213,28 @@ def intrinsics_from_txt(cam_txt):
 def extrinsics_from_xml(xml_file, verbose=False):
     root = ET.parse(xml_file).getroot()
     transforms = {}
+    sensor_ids = {}
     for e in root.findall('chunk/cameras')[0].findall('camera'):
         label = e.get('label')
+        sensor_id = e.get('sensor_id')
         try:
             transforms[label] = e.find('transform').text
+            sensor_ids[label] = sensor_id
         except:
             if verbose:
                 print('failed to align camera', label)
 
     view_matrices = []
+    sensor_id_list = []
     # labels_sort = sorted(list(transforms), key=lambda x: int(x))
     labels_sort = list(transforms)
     for label in labels_sort:
         extrinsic = np.array([float(x) for x in transforms[label].split()]).reshape(4, 4)
         extrinsic[:, 1:3] *= -1
         view_matrices.append(extrinsic)
+        sensor_id_list.append(sensor_ids[label])
 
-    return view_matrices, labels_sort
+    return view_matrices, labels_sort, sensor_id_list
 
 
 def extrinsics_from_view_matrix(path):
@@ -311,8 +318,12 @@ def load_scene_data(path):
     if 'intrinsic_matrix' in config:
         apath = fix_relative_path(config['intrinsic_matrix'], path)
         if apath[-3:] == 'xml':
-            intrinsic_matrix, (width, height) = intrinsics_from_xml(apath)
-            assert tuple(config['viewport_size']) == (width, height), f'calibration width, height: ({width}, {height})'
+            intrinsics_dict = intrinsics_from_xml(apath)
+            if len(intrinsics_dict) == 1:
+                intrinsic_matrix, (width, height) = list(intrinsics_dict.values())[0]
+                assert tuple(config['viewport_size']) == (width, height), f'calibration width, height: ({width}, {height})'
+            else:
+                intrinsic_matrix = intrinsics_dict
         elif apath[-3:] == 'ini':
             intrinsic_matrix, (width, height) = intrinsics_from_ini(apath)
         elif apath[-3:] == 'txt':
@@ -322,16 +333,18 @@ def load_scene_data(path):
     else:
         intrinsic_matrix = None
 
+
     if 'proj_matrix' in config:
         proj_matrix = np.loadtxt(fix_relative_path(config['proj_matrix'], path))
         proj_matrix = recalc_proj_matrix_planes(proj_matrix)
     else:
         proj_matrix = None
 
+    sensor_ids = None
     if 'view_matrix' in config:
         apath = fix_relative_path(config['view_matrix'], path)
         if apath[-3:] == 'xml':
-            view_matrix, camera_labels = extrinsics_from_xml(apath)
+            view_matrix, camera_labels, sensor_ids = extrinsics_from_xml(apath)
         elif apath[-3:] == 'txt':
             view_matrix, camera_labels = extrinsics_from_txt(apath)
         else:
@@ -386,6 +399,7 @@ def load_scene_data(path):
     'camera_labels': camera_labels,     #[:50]
     'model3d_origin': model3d_origin,
     'config': config,
+    'sensor_ids': sensor_ids,
 
     'net_ckpt': net_ckpt,
     'tex_ckpt': tex_ckpt
