@@ -130,6 +130,7 @@ class NetAndTexture(nn.Module):
 
         return loss
 
+    # TODO: enable optional 6DOF Rotation Encoding in the texture vector
     def forward(self, inputs, **kwargs):
         outs = {'im_out':[]}
         # outs = {'x1':[],'x2':[],'x4':[],}
