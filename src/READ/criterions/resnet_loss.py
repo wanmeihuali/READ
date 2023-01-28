@@ -5,7 +5,7 @@ import torchvision
 from READ.models.conv import PartialConv2d
 class ResnetLoss(torch.nn.Module):
     """
-    Resnet Loss
+    Resnet Loss: it actually performs worse than VGG loss. See https://arxiv.org/pdf/2104.05623.pdf
     """
     def __init__(self, partialconv=False, save_dir='.cache/torch/models'):
         super().__init__()
